@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 
 // Structure to track client-specific state
 #[derive(Clone)]
-pub struct ClientState {
+pub struct Client {
     pub workspace_root: String,
     pub initialized: bool,
     pub initialize_params: InitializeParams,
@@ -27,7 +27,7 @@ pub struct ClientState {
 pub struct WorkspaceManager {
     server_process: Arc<Mutex<Option<Child>>>,
     next_client_id: ClientId,
-    client_states: HashMap<ClientId, ClientState>,
+    clients: HashMap<ClientId, Client>,
     request_map: HashMap<ServerRequestId, (ClientId, RequestId)>,
     next_server_request_id: ServerRequestId,
     workspace_roots: Vec<String>, // Track all workspace roots
@@ -38,7 +38,7 @@ impl WorkspaceManager {
         WorkspaceManager {
             server_process: Arc::new(Mutex::new(None)),
             next_client_id: 1,
-            client_states: HashMap::new(),
+            clients: HashMap::new(),
             request_map: HashMap::new(),
             next_server_request_id: 1,
             workspace_roots: Vec::new(),
@@ -54,7 +54,8 @@ impl WorkspaceManager {
         let (client_tx, _client_rx) = mpsc::channel::<Message>(32);
 
         // Add client and get client ID
-        let (client_id, is_first_client) = self.add_client(init_params.clone(), client_tx.clone())?;
+        let (client_id, is_first_client) =
+            self.add_client(init_params.clone(), client_tx.clone())?;
 
         if is_first_client {
             // Send initialize request to server
@@ -124,9 +125,9 @@ impl WorkspaceManager {
             .unwrap_or_else(|| "default_workspace".to_string());
 
         // Create client state
-        self.client_states.insert(
+        self.clients.insert(
             client_id,
-            ClientState {
+            Client {
                 workspace_root: workspace_root.clone(),
                 initialized: false,
                 initialize_params,
@@ -160,19 +161,19 @@ impl WorkspaceManager {
         self.server_process.lock().unwrap().as_mut()
     }
 
-    pub fn get_client_state(&self, client_id: ClientId) -> Option<&ClientState> {
-        self.client_states.get(&client_id)
+    pub fn get_client_state(&self, client_id: ClientId) -> Option<&Client> {
+        self.clients.get(&client_id)
     }
 
     pub fn remove_client(&mut self, client_id: ClientId) -> std::io::Result<Option<String>> {
-        if let Some(state) = self.client_states.remove(&client_id) {
+        if let Some(state) = self.clients.remove(&client_id) {
             let workspace_root = state.workspace_root;
 
             // Remove the workspace root from our list
             self.workspace_roots.retain(|root| root != &workspace_root);
 
             // If no clients left, shut down the server
-            if self.client_states.is_empty() {
+            if self.clients.is_empty() {
                 if let Some(mut server) = self.server_process.lock().unwrap().take() {
                     let _ = server.kill();
                 }
@@ -195,8 +196,10 @@ impl WorkspaceManager {
 
                 self.send_notification_to_server(
                     "workspace/didChangeWorkspaceFolders".to_string(),
-                    Some(serde_json::to_value(params)
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?),
+                    Some(
+                        serde_json::to_value(params)
+                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
+                    ),
                 )?;
             }
 
@@ -302,10 +305,11 @@ impl WorkspaceManager {
                                             .result(message.result)
                                             .error(message.error)
                                             .build();
-                                    
+
                                     // Send response through the client's channel
-                                    if let Some(client_state) = self.client_states.get(&client_id) {
-                                        let _ = client_state.client_sender.send(client_response).await;
+                                    if let Some(client_state) = self.clients.get(&client_id) {
+                                        let _ =
+                                            client_state.client_sender.send(client_response).await;
                                     }
                                 }
                             }
@@ -313,7 +317,7 @@ impl WorkspaceManager {
                         // Check if it's a notification (has method but no id)
                         else if message.method.is_some() && message.id.is_none() {
                             // Broadcast notification to all clients
-                            for client_state in self.client_states.values() {
+                            for client_state in self.clients.values() {
                                 let _ = client_state.client_sender.send(message.clone()).await;
                             }
                         }
@@ -346,10 +350,7 @@ impl WorkspaceManager {
             }
             // Check if it's a notification (has method but no id)
             else if message.method.is_some() && message.id.is_none() {
-                self.send_notification_to_server(
-                    message.method.unwrap(),
-                    message.params,
-                )?;
+                self.send_notification_to_server(message.method.unwrap(), message.params)?;
             }
         }
         Ok(())
@@ -417,10 +418,9 @@ async fn handle_initialize(
     {
         // Initialize client through workspace manager
         let mut manager = workspace_manager.lock().await;
-        let (client_id, client_tx) = manager.handle_client_initialize(
-            init_params,
-            message.id.unwrap(),
-        ).await?;
+        let (client_id, client_tx) = manager
+            .handle_client_initialize(init_params, message.id.unwrap())
+            .await?;
         drop(manager); // Release lock before spawning tasks
 
         // Spawn task to forward messages from channel to client
