@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -13,6 +13,7 @@ use tokio::sync::Mutex;
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tower_lsp::jsonrpc::{self, Request, Response};
 use tower_lsp::lsp_types::*;
+use tracing::{error, info};
 
 mod request_map;
 
@@ -48,8 +49,7 @@ pub struct WorkspaceManager {
     next_client_id: ClientId,
     clients: std::sync::Mutex<HashMap<ClientId, Client>>,
     request_map: Arc<RequestMap>,
-    next_server_request_id: ServerRequestId,
-    workspace_roots: Vec<String>, // Track all workspace roots
+    workspace_roots: Vec<String>,
 }
 
 impl WorkspaceManager {
@@ -71,7 +71,6 @@ impl WorkspaceManager {
             next_client_id: 1,
             clients: std::sync::Mutex::new(HashMap::new()),
             request_map: Arc::new(RequestMap::new()),
-            next_server_request_id: 1,
             workspace_roots: Vec::new(),
         }
     }
@@ -139,59 +138,6 @@ impl WorkspaceManager {
         Ok(())
     }
 
-    pub fn get_next_server_request_id(&mut self) -> ServerRequestId {
-        let id = self.next_server_request_id;
-        self.next_server_request_id += 1;
-        id
-    }
-
-    pub fn map_request(
-        &mut self,
-        server_id: ServerRequestId,
-        client_id: ClientId,
-        request_id: RequestId,
-    ) {
-        self.request_map.insert(server_id, client_id, request_id);
-    }
-
-    pub fn get_request_mapping(
-        &mut self,
-        server_id: &ServerRequestId,
-    ) -> Option<(ClientId, RequestId)> {
-        self.request_map.remove(server_id)
-    }
-
-    pub async fn handle_client_request(
-        &mut self,
-        client_id: ClientId,
-        original_req_id: RequestId,
-        method: Cow<'static, str>,
-        params: Option<Value>,
-    ) -> Result<()> {
-        let server_req_id = self.get_next_server_request_id();
-        self.request_map
-            .insert(server_req_id, client_id, original_req_id);
-
-        // Build the request
-        let request = Request::build(method)
-            .id(server_req_id.to_string())
-            .params(params.unwrap_or(Value::Null))
-            .finish();
-
-        // Write request to server using framed writer
-        let mut server_process = self.server_process.lock().await;
-        if let Some(process) = server_process.as_mut() {
-            if let Some(stdin) = process.stdin.as_mut() {
-                let mut writer = FramedWrite::new(stdin, LspCodec::default());
-                writer
-                    .send(serde_json::to_value(request)?)
-                    .await
-                    .map_err(|_| anyhow::format_err!("failed to send request"))?
-            }
-        }
-        Ok(())
-    }
-
     pub async fn handle_client_notification(
         &mut self,
         method: Cow<'static, str>,
@@ -201,16 +147,21 @@ impl WorkspaceManager {
             .params(params.unwrap_or(Value::Null))
             .finish();
 
-        let mut server_process = self.server_process.lock().await;
-        if let Some(process) = server_process.as_mut() {
-            if let Some(stdin) = process.stdin.as_mut() {
-                let mut writer = FramedWrite::new(stdin, LspCodec::default());
-                writer
-                    .send(serde_json::to_value(notification)?)
-                    .await
-                    .map_err(|_| anyhow::format_err!("failed to send request"))?
-            }
-        }
+        self.send_server_message(notification).await?;
+        Ok(())
+    }
+
+    async fn send_server_message(&mut self, request: Request) -> Result<(), anyhow::Error> {
+        let mut child = self.server_process.lock().await;
+        let stdin = child
+            .as_mut()
+            .and_then(|c| c.stdin.as_mut())
+            .context("server is down")?;
+        let mut writer = FramedWrite::new(stdin, LspCodec::default());
+        writer
+            .send(serde_json::to_value(request)?)
+            .await
+            .map_err(|_| anyhow::format_err!("failed to send request"))?;
         Ok(())
     }
 
@@ -226,12 +177,9 @@ impl WorkspaceManager {
                             // If it's a Response, figure out which client it belongs to using request_map.
                             Message::Response(resp) => {
                                 let (id, resp) = resp.into_parts();
-                                let jsonrpc::Id::Number(id) = id else {
-                                    unreachable!("unknown id")
-                                };
                                 // Attempt to parse the response ID as server_request_id (u64).
                                 if let Some((mapped_client_id, original_req_id)) =
-                                    self.get_request_mapping(&id)
+                                    self.request_map.remove(&id)
                                 {
                                     let clients = self.clients.lock().unwrap();
                                     if let Some(client) = clients.get(&mapped_client_id) {
@@ -258,16 +206,16 @@ impl WorkspaceManager {
                             }
                         }
                     } else {
-                        eprintln!("Server sent unrecognized JSON: {:?}", json_val);
+                        error!("Server sent unrecognized JSON: {:?}", json_val);
                     }
                 }
                 Err(e) => {
-                    eprintln!("Error reading from server: {:?}", e);
+                    error!("Error reading from server: {:?}", e);
                     break;
                 }
             }
         }
-        eprintln!("Server disconnected");
+        error!("Server disconnected");
     }
 
     pub async fn handle_client_message(
@@ -352,12 +300,14 @@ impl WorkspaceManager {
             }
         }
 
-        if let Some(id) = id {
-            self.handle_client_request(client_id, id, method, params)
-                .await?;
+        let request = Request::build(method).params(params.unwrap_or(Value::Null));
+        let request = if let Some(id) = id {
+            let id = self.request_map.insert(client_id, id);
+            request.id(id).finish()
         } else {
-            self.handle_client_notification(method, params).await?;
-        }
+            request.finish()
+        };
+        self.send_server_message(request).await?;
         Ok(())
     }
 }
@@ -372,7 +322,7 @@ pub async fn run_multiplexer(
     // Bind UnixListener
     let listener =
         UnixListener::bind(socket_path).context("Failed to bind to Unix domain socket")?;
-    println!("LSP multiplexer listening on {}", socket_path);
+    info!("LSP multiplexer listening on {}", socket_path);
 
     // Accept connections in a loop
     loop {
@@ -385,7 +335,7 @@ pub async fn run_multiplexer(
         // Spawn a task for each connection, calling helper to handle it
         tokio::spawn(async move {
             if let Err(e) = handle_connection(stream, workspace_manager).await {
-                eprintln!("Failed to handle connection: {}", e);
+                error!("Failed to handle connection: {}", e);
             }
         });
     }
@@ -395,7 +345,7 @@ pub async fn handle_connection(
     stream: UnixStream,
     workspace_manager: Arc<Mutex<WorkspaceManager>>,
 ) -> Result<()> {
-    println!("New client connected");
+    info!("New client connected");
 
     // Create channels for client communication
     let (client_response_tx, mut client_response_rx) = mpsc::channel(32);
@@ -421,7 +371,7 @@ pub async fn handle_connection(
                 .send(serde_json::to_value(msg).expect("serialize always works"))
                 .await
             {
-                eprintln!("Error sending response to client: {:?}", e);
+                error!("Error sending response to client: {:?}", e);
                 break;
             }
         }
@@ -435,13 +385,13 @@ pub async fn handle_connection(
                 if let Ok(request) = serde_json::from_value::<Request>(json_val) {
                     let mut manager = workspace_manager.lock().await;
                     if let Err(e) = manager.handle_client_message(client_id, request).await {
-                        eprintln!("Error handling client message: {}", e);
+                        error!("Error handling client message: {}", e);
                         break;
                     }
                 }
             }
             Err(e) => {
-                eprintln!("Error reading from client: {:?}", e);
+                error!("Error reading from client: {:?}", e);
                 break;
             }
         }
