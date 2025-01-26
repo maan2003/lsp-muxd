@@ -49,9 +49,9 @@ impl WorkspaceManager {
         &mut self,
         init_params: InitializeParams,
         init_request_id: RequestId,
-    ) -> Result<(ClientId, mpsc::Sender<Message>), Box<dyn std::error::Error>> {
+    ) -> Result<(ClientId, mpsc::Receiver<jsonrpc::Request>), Box<dyn std::error::Error>> {
         // Create channel for sending responses back to client
-        let (client_tx, _client_rx) = mpsc::channel::<Message>(32);
+        let (client_tx, client_rx) = mpsc::channel::<Message>(32);
 
         // Add client and get client ID
         let (client_id, is_first_client) =
@@ -106,7 +106,7 @@ impl WorkspaceManager {
             // TODO: Cache and return the initialize response for subsequent clients
         }
 
-        Ok((client_id, client_tx))
+        Ok((client_id, client_rx))
     }
 
     pub fn add_client(
@@ -418,7 +418,7 @@ async fn handle_initialize(
     {
         // Initialize client through workspace manager
         let mut manager = workspace_manager.lock().await;
-        let (client_id, client_tx) = manager
+        let (client_id, client_rx) = manager
             .handle_client_initialize(init_params, message.id.unwrap())
             .await?;
         drop(manager); // Release lock before spawning tasks
@@ -426,7 +426,6 @@ async fn handle_initialize(
         // Spawn task to forward messages from channel to client
         let mut stream_clone = stream.clone();
         tokio::spawn(async move {
-            let mut client_rx = client_tx;
             while let Some(msg) = client_rx.recv().await {
                 if let Ok(msg_str) = serde_json::to_string(&msg) {
                     let _ = stream_clone.write_all(msg_str.as_bytes()).await;
