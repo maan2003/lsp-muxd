@@ -1,7 +1,11 @@
 use std::collections::HashMap;
 use std::process::{Child, Command, Stdio};
-use tokio::io::AsyncBufReadExt;
-use tower_lsp::jsonrpc;
+use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, BufStream};
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::Mutex;
+use tower_lsp::jsonrpc::{self, Message};
+use tower_lsp::lsp_types::*;
 
 pub type ClientId = u64;
 pub type RequestId = jsonrpc::Id;
@@ -134,9 +138,8 @@ impl WorkspaceManager {
         self.map_request(server_req_id.clone(), client_id, original_req_id);
 
         // 2) Build and serialize the request
-        let request = tower_lsp::jsonrpc::RequestBuilder::default()
+        let request = tower_lsp::jsonrpc::Request::build(method)
             .id(server_req_id)
-            .method(method)
             .params(params.unwrap_or(serde_json::Value::Null))
             .build();
 
@@ -154,8 +157,7 @@ impl WorkspaceManager {
         method: String,
         params: Option<serde_json::Value>,
     ) -> std::io::Result<()> {
-        let notification = tower_lsp::jsonrpc::NotificationBuilder::default()
-            .method(method)
+        let notification = tower_lsp::jsonrpc::Request::build(method)
             .params(params.unwrap_or(serde_json::Value::Null))
             .build();
 
@@ -291,4 +293,139 @@ impl WorkspaceManager {
             }
         }
     }
+}
+
+pub async fn run_multiplexer(
+    socket_path: &str,
+    workspace_manager: Arc<Mutex<WorkspaceManager>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Remove existing socket file if it exists
+    let _ = std::fs::remove_file(socket_path);
+
+    // Bind UnixListener
+    let listener = UnixListener::bind(socket_path)?;
+    println!("LSP multiplexer listening on {}", socket_path);
+
+    // Accept connections in a loop
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let workspace_manager = Arc::clone(&workspace_manager);
+
+        // Spawn a task for each connection, calling helper to handle it
+        tokio::spawn(async move {
+            if let Err(e) = handle_connection(stream, workspace_manager).await {
+                eprintln!("Failed to handle connection: {}", e);
+            }
+        });
+    }
+}
+
+pub async fn handle_connection(
+    stream: UnixStream,
+    workspace_manager: Arc<Mutex<WorkspaceManager>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut stream = BufStream::new(stream);
+    println!("New client connected");
+
+    let mut message_buf = String::new();
+
+    // Read the initialize request
+    let n = stream.read_line(&mut message_buf).await?;
+    if n == 0 {
+        println!("Client disconnected before initialization");
+        return Ok(());
+    }
+
+    if let Ok(message) = serde_json::from_str::<jsonrpc::Request>(&message_buf) {
+        if message.method() == "initialize" {
+            handle_initialize(message, &workspace_manager, stream).await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_initialize(
+    message: Message,
+    workspace_manager: &Arc<Mutex<WorkspaceManager>>,
+    stream: BufStream<UnixStream>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Parse the InitializeParams
+    if let Ok(init_params) =
+        serde_json::from_value::<InitializeParams>(message.params.unwrap_or_default())
+    {
+        let workspace_root = init_params
+            .root_uri
+            .map(|uri| uri.to_string())
+            .unwrap_or_else(|| "default_workspace".to_string());
+
+        // Add client
+        let mut manager = workspace_manager.lock().await;
+        match manager.add_client(workspace_root.clone()) {
+            Ok((client_id, is_first_client)) => {
+                if is_first_client {
+                    let server_id = manager.get_next_server_request_id();
+                    manager.send_request_to_server(
+                        server_id,
+                        client_id,
+                        message.id.unwrap(),
+                        "initialize".to_string(),
+                        Some(serde_json::to_value(init_params)?),
+                    )?;
+
+                    // Spawn server-handling
+                    let server_stdout = std::io::BufReader::new(
+                        manager
+                            .get_server_process_mut()
+                            .unwrap()
+                            .stdout
+                            .take()
+                            .unwrap(),
+                    );
+                    let manager_clone = Arc::clone(workspace_manager);
+                    tokio::spawn(async move {
+                        manager_clone
+                            .lock()
+                            .await
+                            .handle_server_messages(server_stdout)
+                            .await;
+                    });
+                } else {
+                    // Send workspace/didChangeWorkspaceFolders
+                    let params = DidChangeWorkspaceFoldersParams {
+                        event: WorkspaceFoldersChangeEvent {
+                            added: vec![WorkspaceFolder {
+                                uri: Url::parse(&format!("file://{}", workspace_root))?,
+                                name: workspace_root
+                                    .split('/')
+                                    .last()
+                                    .unwrap_or("unknown")
+                                    .to_string(),
+                            }],
+                            removed: vec![],
+                        },
+                    };
+                    manager.send_notification_to_server(
+                        "workspace/didChangeWorkspaceFolders".to_string(),
+                        Some(serde_json::to_value(params)?),
+                    )?;
+                    // TODO: Implement caching of initialize response
+                }
+
+                // Spawn client message forwarding
+                let wm_clone = Arc::clone(workspace_manager);
+                tokio::spawn(async move {
+                    wm_clone
+                        .lock()
+                        .await
+                        .handle_client_messages(client_id, stream)
+                        .await;
+                });
+            }
+            Err(e) => {
+                eprintln!("Failed to add client: {}", e);
+            }
+        }
+    }
+    Ok(())
 }
