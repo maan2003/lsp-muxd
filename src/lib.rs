@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::borrow::Cow;
 use std::collections::HashMap;
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, BufReader};
@@ -13,7 +13,7 @@ use tokio::sync::Mutex;
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tower_lsp::jsonrpc::{self, Request, Response};
 use tower_lsp::lsp_types::*;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 mod request_map;
 
@@ -45,33 +45,19 @@ pub struct Client {
 
 // Main workspace state management
 pub struct WorkspaceManager {
-    server_process: Arc<Mutex<Option<Child>>>,
+    server_process: Option<Child>,
     next_client_id: ClientId,
-    clients: std::sync::Mutex<HashMap<ClientId, Client>>,
+    clients: HashMap<ClientId, Client>,
     request_map: Arc<RequestMap>,
-    workspace_roots: Vec<Url>,
 }
 
 impl WorkspaceManager {
-    pub fn get_client(&self, client_id: ClientId) -> Result<Client> {
-        let lock = self
-            .clients
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Failed to acquire lock"))?;
-        if let Some(client) = lock.get(&client_id) {
-            Ok(client.clone())
-        } else {
-            anyhow::bail!("Client with ID {} not found", client_id)
-        }
-    }
-
     pub fn new() -> Self {
         WorkspaceManager {
-            server_process: Arc::new(Mutex::new(None)),
+            server_process: None,
             next_client_id: 1,
-            clients: std::sync::Mutex::new(HashMap::new()),
+            clients: HashMap::new(),
             request_map: Arc::new(RequestMap::new()),
-            workspace_roots: Vec::new(),
         }
     }
 
@@ -84,36 +70,23 @@ impl WorkspaceManager {
             client_response_tx,
         };
 
-        // Store in sync map
-        self.clients.lock().unwrap().insert(client_id, client);
+        self.clients.insert(client_id, client);
 
         client_id
     }
 
     pub async fn remove_client(&mut self, client_id: ClientId) -> Result<()> {
-        let (client, is_last);
-        // Remove from sync map
-        {
-            let mut clients = self.clients.lock().unwrap();
-            client = clients.remove(&client_id).context("client not found")?;
-            is_last = clients.is_empty();
-        }
-
-        let workspace_root = client.workspace_root;
-
-        // Remove the workspace root from our list
-        if let Some(ref root) = workspace_root {
-            self.workspace_roots.retain(|r| r != root);
-        }
-
+        let client = self
+            .clients
+            .remove(&client_id)
+            .context("client not found")?;
         // If no clients left, shut down the server
-        if is_last {
-            let mut server_lock = self.server_process.lock().await;
-            if let Some(mut server) = server_lock.take() {
-                let _ = server.kill();
+        if self.clients.is_empty() {
+            if let Some(mut server) = self.server_process.take() {
+                let _ = server.kill().await;
             }
         } else {
-            if let Some(root) = workspace_root {
+            if let Some(root) = client.workspace_root {
                 let params = DidChangeWorkspaceFoldersParams {
                     event: WorkspaceFoldersChangeEvent {
                         added: vec![],
@@ -124,12 +97,13 @@ impl WorkspaceManager {
                     },
                 };
 
-                self.handle_client_notification(
-                    "workspace/didChangeWorkspaceFolders".into(),
-                    Some(
-                        serde_json::to_value(params)
-                            .context("Failed to serialize workspace change params")?,
-                    ),
+                self.send_server_message(
+                    Request::build("workspace/didChangeWorkspaceFolders")
+                        .params(
+                            serde_json::to_value(params)
+                                .context("Failed to serialize workspace change params")?,
+                        )
+                        .finish(),
                 )
                 .await?;
             }
@@ -137,22 +111,9 @@ impl WorkspaceManager {
         Ok(())
     }
 
-    pub async fn handle_client_notification(
-        &mut self,
-        method: Cow<'static, str>,
-        params: Option<Value>,
-    ) -> Result<()> {
-        let notification = Request::build(method)
-            .params(params.unwrap_or(Value::Null))
-            .finish();
-
-        self.send_server_message(notification).await?;
-        Ok(())
-    }
-
     async fn send_server_message(&mut self, request: Request) -> Result<(), anyhow::Error> {
-        let mut child = self.server_process.lock().await;
-        let stdin = child
+        let stdin = self
+            .server_process
             .as_mut()
             .and_then(|c| c.stdin.as_mut())
             .context("server is down")?;
@@ -164,7 +125,37 @@ impl WorkspaceManager {
         Ok(())
     }
 
-    pub async fn handle_server_messages(&mut self, server_stdout: impl AsyncRead + Unpin) {
+    pub async fn handle_server_message(&mut self, message: Message) -> anyhow::Result<()> {
+        match message {
+            // If it's a Response, figure out which client it belongs to using request_map.
+            Message::Response(resp) => {
+                let (id, resp) = resp.into_parts();
+                // Attempt to parse the response ID as server_request_id (u64).
+                let (mapped_client_id, original_req_id) =
+                    self.request_map.remove(&id).context("unknown response")?;
+                let Some(client) = self.clients.get(&mapped_client_id) else {
+                    warn!("server response after client gone");
+                    return Ok(());
+                };
+                client
+                    .client_response_tx
+                    .send(Message::Response(Response::from_parts(
+                        original_req_id,
+                        resp,
+                    )))
+                    .await
+                    .ok();
+            }
+
+            Message::Request(_) => {
+                for client in self.clients.values() {
+                    client.client_response_tx.send(message.clone()).await.ok();
+                }
+            }
+        }
+        Ok(())
+    }
+    pub async fn handle_server_messages(this: &Mutex<Self>, server_stdout: impl AsyncRead + Unpin) {
         let mut reader = FramedRead::new(server_stdout, LspCodec::default());
 
         while let Some(message_result) = reader.next().await {
@@ -172,37 +163,8 @@ impl WorkspaceManager {
                 Ok(json_val) => {
                     // Attempt to parse into Message.
                     if let Ok(message) = serde_json::from_value::<Message>(json_val.clone()) {
-                        match message {
-                            // If it's a Response, figure out which client it belongs to using request_map.
-                            Message::Response(resp) => {
-                                let (id, resp) = resp.into_parts();
-                                // Attempt to parse the response ID as server_request_id (u64).
-                                if let Some((mapped_client_id, original_req_id)) =
-                                    self.request_map.remove(&id)
-                                {
-                                    let clients = self.clients.lock().unwrap();
-                                    if let Some(client) = clients.get(&mapped_client_id) {
-                                        let _ = client
-                                            .client_response_tx
-                                            .send(Message::Response(Response::from_parts(
-                                                original_req_id,
-                                                resp,
-                                            )))
-                                            .await;
-                                    }
-                                } else {
-                                    tracing::error!("Unknown response")
-                                }
-                            }
-
-                            // If it's a Request or a Notification from the server,
-                            // forward to all clients
-                            Message::Request(_) => {
-                                let clients = self.clients.lock().unwrap();
-                                for (_cid, client) in clients.iter() {
-                                    let _ = client.client_response_tx.send(message.clone()).await;
-                                }
-                            }
+                        if let Err(e) = this.lock().await.handle_server_message(message).await {
+                            error!("Failed to handle server message: {e:?}");
                         }
                     } else {
                         error!("Server sent unrecognized JSON: {:?}", json_val);
@@ -218,7 +180,7 @@ impl WorkspaceManager {
     }
 
     pub async fn handle_client_message(
-        &mut self,
+        this: &Arc<Mutex<Self>>,
         client_id: ClientId,
         request: Request,
     ) -> Result<()> {
@@ -226,84 +188,78 @@ impl WorkspaceManager {
 
         // Special handling for initialize request
         if method == "initialize" {
-            let mut client = self.get_client(client_id)?;
-            // Parse initialize params
-            let init_params =
-                serde_json::from_value::<InitializeParams>(params.clone().unwrap_or(Value::Null))
-                    .context("invalid request")?;
-            // Extract workspace root
-            let workspace_root = init_params.root_uri.context("root uri not present")?;
-
-            client.workspace_root = Some(workspace_root.clone());
-
-            // Add workspace root if not already present
-            if !self.workspace_roots.contains(&workspace_root) {
-                self.workspace_roots.push(workspace_root.clone());
-            }
-
-            let mut server_process = self.server_process.lock().await;
-            if server_process.is_none() {
-                // Launch the global LSP server process
-                let new_server_process = Command::new("rust-analyzer")
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .context("Failed to spawn rust-analyzer process")?;
-
-                *server_process = Some(new_server_process);
-
-                // Take server stdout for handling messages
-                if let Some(server) = server_process.as_mut() {
-                    if let Some(stdout) = server.stdout.take() {
-                        let _server_stdout = BufReader::new(stdout);
-                        // FIXME:
-                        // let this = Arc::new(Mutex::new(self.clone()));
-                        // tokio::spawn(async move {
-                        //     let mut manager = this.lock().await;
-                        //     manager.handle_server_messages(server_stdout).await;
-                        // });
-                    }
-                }
-            } else {
-                drop(server_process);
-                // Send workspace/didChangeWorkspaceFolders for additional clients
-                let params = DidChangeWorkspaceFoldersParams {
-                    event: WorkspaceFoldersChangeEvent {
-                        added: vec![WorkspaceFolder {
-                            uri: workspace_root,
-                            name: Default::default(),
-                        }],
-                        removed: vec![],
-                    },
-                };
-
-                self.send_server_message(
-                    Request::build("workspace/didChangeWorkspaceFolders")
-                        .params(
-                            serde_json::to_value(params)
-                                .context("Failed to serialize workspace change params")?,
-                        )
-                        .finish(),
-                )
-                .await?;
-            }
-        }
-
-        let request = Request::build(method).params(params.unwrap_or(Value::Null));
-        let request = if let Some(id) = id {
-            let id = self.request_map.insert(client_id, id);
-            request.id(id).finish()
+            Self::handle_client_initialize(this, client_id, &params).await?;
         } else {
-            request.finish()
-        };
-        self.send_server_message(request).await?;
+            let mut this = this.lock().await;
+            let request = Request::build(method).params(params.unwrap_or(Value::Null));
+            let request = if let Some(id) = id {
+                let id = this.request_map.insert(client_id, id);
+                request.id(id).finish()
+            } else {
+                request.finish()
+            };
+            this.send_server_message(request).await?;
+        }
+        Ok(())
+    }
+
+    async fn handle_client_initialize(
+        this: &Arc<Mutex<Self>>,
+        client_id: ClientId,
+        params: &Option<Value>,
+    ) -> Result<(), anyhow::Error> {
+        let mut thil = this.lock().await;
+        let init_params =
+            serde_json::from_value::<InitializeParams>(params.clone().unwrap_or(Value::Null))
+                .context("invalid request")?;
+        let workspace_root = init_params.root_uri.context("root uri not present")?;
+        thil.clients
+            .get_mut(&client_id)
+            .context("client gone")?
+            .workspace_root = Some(workspace_root.clone());
+        if thil.server_process.is_none() {
+            // Launch the global LSP server process
+            let mut new_server_process = Command::new("rust-analyzer")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .context("Failed to spawn rust-analyzer process")?;
+
+            let stdout = BufReader::new(new_server_process.stdout.take().unwrap());
+            let server_stdout = BufReader::new(stdout);
+            thil.server_process = Some(new_server_process);
+
+            // Take server stdout for handling messages
+            let this = this.clone();
+            tokio::spawn(async move { Self::handle_server_messages(&this, server_stdout).await });
+        } else {
+            let params = DidChangeWorkspaceFoldersParams {
+                event: WorkspaceFoldersChangeEvent {
+                    added: vec![WorkspaceFolder {
+                        uri: workspace_root,
+                        name: Default::default(),
+                    }],
+                    removed: vec![],
+                },
+            };
+
+            thil.send_server_message(
+                Request::build("workspace/didChangeWorkspaceFolders")
+                    .params(
+                        serde_json::to_value(params)
+                            .context("Failed to serialize workspace change params")?,
+                    )
+                    .finish(),
+            )
+            .await?;
+        }
         Ok(())
     }
 }
 
 pub async fn run_multiplexer(
-    socket_path: &str,
+    socket_path: &Path,
     workspace_manager: Arc<Mutex<WorkspaceManager>>,
 ) -> Result<()> {
     // Remove existing socket file if it exists
@@ -312,9 +268,11 @@ pub async fn run_multiplexer(
     // Bind UnixListener
     let listener =
         UnixListener::bind(socket_path).context("Failed to bind to Unix domain socket")?;
-    info!("LSP multiplexer listening on {}", socket_path);
+    info!(
+        "LSP multiplexer listening on {}",
+        socket_path.to_string_lossy()
+    );
 
-    // Accept connections in a loop
     loop {
         let (stream, _) = listener
             .accept()
@@ -322,7 +280,6 @@ pub async fn run_multiplexer(
             .context("Failed to accept connection")?;
         let workspace_manager = Arc::clone(&workspace_manager);
 
-        // Spawn a task for each connection, calling helper to handle it
         tokio::spawn(async move {
             if let Err(e) = handle_connection(stream, workspace_manager).await {
                 error!("Failed to handle connection: {}", e);
@@ -337,23 +294,18 @@ pub async fn handle_connection(
 ) -> Result<()> {
     info!("New client connected");
 
-    // Create channels for client communication
     let (client_response_tx, mut client_response_rx) = mpsc::channel(32);
 
-    // Register client and get ID
-    let client_id = {
-        let mut manager = workspace_manager.lock().await;
-        manager.register_client(client_response_tx)
-    };
+    let client_id = workspace_manager
+        .lock()
+        .await
+        .register_client(client_response_tx);
 
-    // Split stream into read and write parts
     let (read_half, write_half) = stream.into_split();
 
-    // Create framed reader and writer
     let mut reader = FramedRead::new(read_half, LspCodec::default());
     let writer = FramedWrite::new(write_half, LspCodec::default());
 
-    // Spawn task to forward responses to client
     tokio::spawn(async move {
         let mut writer = writer;
         while let Some(msg) = client_response_rx.recv().await {
@@ -367,29 +319,25 @@ pub async fn handle_connection(
         }
     });
 
-    // Handle incoming messages
-    while let Some(message_result) = reader.next().await {
-        match message_result {
-            Ok(json_val) => {
-                // Convert Message to Request if possible
-                if let Ok(request) = serde_json::from_value::<Request>(json_val) {
-                    let mut manager = workspace_manager.lock().await;
-                    if let Err(e) = manager.handle_client_message(client_id, request).await {
-                        error!("Error handling client message: {}", e);
-                        break;
-                    }
-                }
-            }
-            Err(e) => {
-                error!("Error reading from client: {:?}", e);
-                break;
+    while let Some(message) = reader
+        .next()
+        .await
+        .transpose()
+        .map_err(|e| anyhow::format_err!("invalid input: {e:?}"))?
+    {
+        let message = serde_json::from_value::<Message>(message).context("invalid request")?;
+        match message {
+            Message::Response(_) => warn!("ignore client response"),
+            Message::Request(request) => {
+                WorkspaceManager::handle_client_message(&workspace_manager, client_id, request)
+                    .await?
             }
         }
     }
 
-    // Client disconnected, clean up
-    let mut manager = workspace_manager.lock().await;
-    manager
+    workspace_manager
+        .lock()
+        .await
         .remove_client(client_id)
         .await
         .context("Failed to remove client")?;
