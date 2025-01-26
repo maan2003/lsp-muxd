@@ -16,10 +16,10 @@ use tokio::sync::mpsc;
 // Structure to track client-specific state
 #[derive(Clone)]
 pub struct Client {
-    pub workspace_root: String,
-    pub initialized: bool,
-    pub initialize_params: InitializeParams,
-    pub client_sender: mpsc::Sender<Message>,
+    workspace_root: Option<String>,
+    client_response_tx: mpsc::Sender<jsonrpc::Response>,
+    server_request_tx: mpsc::Sender<jsonrpc::Request>,
+    initialized: bool,
 }
 
 // Main workspace state management
@@ -27,7 +27,7 @@ pub struct Client {
 pub struct WorkspaceManager {
     server_process: Arc<Mutex<Option<Child>>>,
     next_client_id: ClientId,
-    clients: HashMap<ClientId, Client>,
+    clients: HashMap<ClientId, Mutex<Client>>,
     request_map: HashMap<ServerRequestId, (ClientId, RequestId)>,
     next_server_request_id: ServerRequestId,
     workspace_roots: Vec<String>, // Track all workspace roots
@@ -45,116 +45,23 @@ impl WorkspaceManager {
         }
     }
 
-    pub async fn handle_client_initialize(
+    pub fn register_client(
         &mut self,
-        init_params: InitializeParams,
-        init_request_id: RequestId,
-    ) -> Result<(ClientId, mpsc::Receiver<jsonrpc::Request>), Box<dyn std::error::Error>> {
-        // Create channel for sending responses back to client
-        let (client_tx, client_rx) = mpsc::channel::<Message>(32);
-
-        // Add client and get client ID
-        let (client_id, is_first_client) =
-            self.add_client(init_params.clone(), client_tx.clone())?;
-
-        if is_first_client {
-            // Send initialize request to server
-            let server_id = self.get_next_server_request_id();
-            self.send_request_to_server(
-                server_id,
-                client_id,
-                init_request_id,
-                "initialize".to_string(),
-                Some(serde_json::to_value(init_params)?),
-            )?;
-
-            // Take server stdout for handling messages
-            if let Some(server) = self.get_server_process_mut() {
-                if let Some(stdout) = server.stdout.take() {
-                    let server_stdout = std::io::BufReader::new(stdout);
-                    let this = self.clone();
-                    tokio::spawn(async move {
-                        this.handle_server_messages(server_stdout).await;
-                    });
-                }
-            }
-        } else {
-            // Send workspace/didChangeWorkspaceFolders for additional clients
-            let workspace_root = init_params
-                .root_uri
-                .map(|uri| uri.path().to_string())
-                .unwrap_or_else(|| "default_workspace".to_string());
-
-            let params = DidChangeWorkspaceFoldersParams {
-                event: WorkspaceFoldersChangeEvent {
-                    added: vec![WorkspaceFolder {
-                        uri: Url::parse(&format!("file://{}", workspace_root))?,
-                        name: workspace_root
-                            .split('/')
-                            .last()
-                            .unwrap_or("unknown")
-                            .to_string(),
-                    }],
-                    removed: vec![],
-                },
-            };
-
-            self.send_notification_to_server(
-                "workspace/didChangeWorkspaceFolders".to_string(),
-                Some(serde_json::to_value(params)?),
-            )?;
-            // TODO: Cache and return the initialize response for subsequent clients
-        }
-
-        Ok((client_id, client_rx))
-    }
-
-    pub fn add_client(
-        &mut self,
-        initialize_params: InitializeParams,
-        client_sender: mpsc::Sender<Message>,
-    ) -> Result<(ClientId, bool), std::io::Error> {
+        client_response_tx: mpsc::Sender<jsonrpc::Response>,
+        server_request_tx: mpsc::Sender<jsonrpc::Request>,
+    ) -> ClientId {
         let client_id = self.next_client_id;
         self.next_client_id += 1;
 
-        // Extract workspace root from initialize params
-        let workspace_root = initialize_params
-            .root_uri
-            .as_ref()
-            .map(|uri| uri.path().to_string())
-            .unwrap_or_else(|| "default_workspace".to_string());
+        let client = Client {
+            workspace_root: None,
+            client_response_tx,
+            server_request_tx,
+            initialized: false,
+        };
 
-        // Create client state
-        self.clients.insert(
-            client_id,
-            Client {
-                workspace_root: workspace_root.clone(),
-                initialized: false,
-                initialize_params,
-                client_sender,
-            },
-        );
-
-        let mut server_process = self.server_process.lock().unwrap();
-        let is_first_client = server_process.is_none();
-
-        if is_first_client {
-            // Launch the global LSP server process
-            let new_server_process = Command::new("rust-analyzer") // Example: using rust-analyzer
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()?;
-
-            *server_process = Some(new_server_process);
-        }
-
-        // Add workspace root if not already present
-        if !self.workspace_roots.contains(&workspace_root) {
-            self.workspace_roots.push(workspace_root);
-        }
-
-        Ok((client_id, is_first_client))
+        self.clients.insert(client_id, Mutex::new(client));
+        client_id
     }
 
     pub fn get_server_process_mut(&mut self) -> Option<&mut Child> {
@@ -194,7 +101,7 @@ impl WorkspaceManager {
                     },
                 };
 
-                self.send_notification_to_server(
+                self.handle_client_notification(
                     "workspace/didChangeWorkspaceFolders".to_string(),
                     Some(
                         serde_json::to_value(params)
@@ -231,15 +138,15 @@ impl WorkspaceManager {
         self.request_map.remove(server_id)
     }
 
-    pub fn send_request_to_server(
+    pub fn handle_client_request(
         &mut self,
         server_req_id: ServerRequestId,
         client_id: ClientId,
         original_req_id: RequestId,
-        method: String,
+        method: Cow<'static, str>,
         params: Option<serde_json::Value>,
     ) -> std::io::Result<()> {
-        // 1) Map server_req_id → (client_id, original_req_id)
+        let server_req_id = self.get_next_server_request_id();
         self.map_request(server_req_id.clone(), client_id, original_req_id);
 
         // 2) Build and serialize the request
@@ -257,7 +164,7 @@ impl WorkspaceManager {
         Ok(())
     }
 
-    pub fn send_notification_to_server(
+    pub fn handle_client_notification(
         &mut self,
         method: String,
         params: Option<serde_json::Value>,
@@ -334,24 +241,92 @@ impl WorkspaceManager {
     pub async fn handle_client_message(
         &mut self,
         client_id: ClientId,
-        message: tower_lsp::jsonrpc::Message,
+        request: tower_lsp::jsonrpc::Request,
     ) -> std::io::Result<()> {
-        if let Some(_state) = self.get_client_state(client_id) {
-            // Check if it's a request (has method and id)
-            if message.method.is_some() && message.id.is_some() {
-                let server_id = self.get_next_server_request_id();
-                self.send_request_to_server(
-                    server_id,
-                    client_id,
-                    message.id.unwrap(),
-                    message.method.unwrap(),
-                    message.params,
-                )?;
+        let (method, id, params) = request.into_parts();
+
+        // Special handling for initialize request
+        if method == "initialize" {
+            if let Some(client_state) = self.clients.get_mut(&client_id) {
+                let mut client = client_state.lock().await;
+                if !client.initialized {
+                    // Parse initialize params
+                    if let Ok(init_params) =
+                        serde_json::from_value::<InitializeParams>(params.unwrap_or_default())
+                    {
+                        // Extract workspace root
+                        let workspace_root = init_params
+                            .root_uri
+                            .as_ref()
+                            .map(|uri| uri.path().to_string())
+                            .unwrap_or_else(|| "default_workspace".to_string());
+
+                        client.workspace_root = Some(workspace_root.clone());
+                        client.initialized = true;
+
+                        // Add workspace root if not already present
+                        if !self.workspace_roots.contains(&workspace_root) {
+                            self.workspace_roots.push(workspace_root.clone());
+                        }
+
+                        let mut server_process = self.server_process.lock().await;
+                        if server_process.is_none() {
+                            // Launch the global LSP server process
+                            let new_server_process = Command::new("rust-analyzer")
+                                .stdin(Stdio::piped())
+                                .stdout(Stdio::piped())
+                                .stderr(Stdio::piped())
+                                .spawn()?;
+
+                            *server_process = Some(new_server_process);
+
+                            // Take server stdout for handling messages
+                            if let Some(server) = server_process.as_mut() {
+                                if let Some(stdout) = server.stdout.take() {
+                                    let server_stdout = std::io::BufReader::new(stdout);
+                                    let this = self.clone();
+                                    tokio::spawn(async move {
+                                        this.handle_server_messages(server_stdout).await;
+                                    });
+                                }
+                            }
+                        } else {
+                            // Send workspace/didChangeWorkspaceFolders for additional clients
+                            let params = DidChangeWorkspaceFoldersParams {
+                                event: WorkspaceFoldersChangeEvent {
+                                    added: vec![WorkspaceFolder {
+                                        uri: Url::parse(&format!("file://{}", workspace_root))
+                                            .map_err(|e| {
+                                                std::io::Error::new(std::io::ErrorKind::Other, e)
+                                            })?,
+                                        name: workspace_root
+                                            .split('/')
+                                            .last()
+                                            .unwrap_or("unknown")
+                                            .to_string(),
+                                    }],
+                                    removed: vec![],
+                                },
+                            };
+
+                            self.handle_client_notification(
+                                "workspace/didChangeWorkspaceFolders".to_string(),
+                                Some(serde_json::to_value(params).map_err(|e| {
+                                    std::io::Error::new(std::io::ErrorKind::Other, e)
+                                })?),
+                            )?;
+                        }
+                    }
+                }
             }
-            // Check if it's a notification (has method but no id)
-            else if message.method.is_some() && message.id.is_none() {
-                self.send_notification_to_server(message.method.unwrap(), message.params)?;
-            }
+        }
+
+        // Forward request to server
+        let server_req_id = self.get_next_server_request_id();
+        if let Some(id) = id {
+            self.handle_client_request(server_req_id, client_id, id, method, params)?;
+        } else {
+            self.handle_client_notification(method, params)?;
         }
         Ok(())
     }
@@ -389,77 +364,53 @@ pub async fn handle_connection(
     let mut stream = BufStream::new(stream);
     println!("New client connected");
 
-    let mut message_buf = String::new();
+    // Create channels for client communication
+    let (client_response_tx, mut client_response_rx) = mpsc::channel::<jsonrpc::Response>(32);
+    let (server_request_tx, mut server_request_rx) = mpsc::channel::<jsonrpc::Request>(32);
 
-    // Read the initialize request
-    let n = stream.read_line(&mut message_buf).await?;
-    if n == 0 {
-        println!("Client disconnected before initialization");
-        return Ok(());
-    }
-
-    if let Ok(message) = serde_json::from_str::<jsonrpc::Request>(&message_buf) {
-        if message.method() == "initialize" {
-            handle_initialize(message, &workspace_manager, stream).await?;
-        }
-    }
-
-    Ok(())
-}
-
-async fn handle_initialize(
-    message: Message,
-    workspace_manager: &Arc<Mutex<WorkspaceManager>>,
-    mut stream: BufStream<UnixStream>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Parse the InitializeParams
-    if let Ok(init_params) =
-        serde_json::from_value::<InitializeParams>(message.params.unwrap_or_default())
-    {
-        // Initialize client through workspace manager
+    // Register client and get ID
+    let client_id = {
         let mut manager = workspace_manager.lock().await;
-        let (client_id, client_rx) = manager
-            .handle_client_initialize(init_params, message.id.unwrap())
-            .await?;
-        drop(manager); // Release lock before spawning tasks
+        manager.register_client(client_response_tx, server_request_tx)
+    };
 
-        // Spawn task to forward messages from channel to client
-        let mut stream_clone = stream.clone();
-        tokio::spawn(async move {
-            while let Some(msg) = client_rx.recv().await {
-                if let Ok(msg_str) = serde_json::to_string(&msg) {
-                    let _ = stream_clone.write_all(msg_str.as_bytes()).await;
-                    let _ = stream_clone.write_all(b"\n").await;
-                    let _ = stream_clone.flush().await;
+    // Spawn task to forward responses to client
+    let mut stream_clone = stream.clone();
+    tokio::spawn(async move {
+        while let Some(msg) = client_response_rx.recv().await {
+            if let Ok(msg_str) = serde_json::to_string(&msg) {
+                let _ = stream_clone.write_all(msg_str.as_bytes()).await;
+                let _ = stream_clone.write_all(b"\n").await;
+                let _ = stream_clone.flush().await;
+            }
+        }
+    });
+
+    // Handle incoming messages
+    let mut message_buf = String::new();
+    loop {
+        message_buf.clear();
+        match stream.read_line(&mut message_buf).await {
+            Ok(0) => {
+                // Client disconnected
+                let mut manager = workspace_manager.lock().await;
+                let _ = manager.remove_client(client_id)?;
+                break;
+            }
+            Ok(_) => {
+                if let Ok(message) =
+                    serde_json::from_str::<tower_lsp::jsonrpc::Request>(&message_buf)
+                {
+                    let mut manager = workspace_manager.lock().await;
+                    let _ = manager.handle_client_message(client_id, message).await;
                 }
             }
-        });
-
-        // Handle client messages in this task
-        let mut message_buf = String::new();
-        loop {
-            message_buf.clear();
-            match stream.read_line(&mut message_buf).await {
-                Ok(0) => {
-                    // Client disconnected
-                    let mut manager = workspace_manager.lock().await;
-                    let _ = manager.remove_client(client_id)?;
-                    break;
-                }
-                Ok(_) => {
-                    if let Ok(message) =
-                        serde_json::from_str::<tower_lsp::jsonrpc::Message>(&message_buf)
-                    {
-                        let mut manager = workspace_manager.lock().await;
-                        let _ = manager.handle_client_message(client_id, message).await;
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Error reading from client: {}", e);
-                    break;
-                }
+            Err(e) => {
+                eprintln!("Error reading from client: {}", e);
+                break;
             }
         }
     }
+
     Ok(())
 }
