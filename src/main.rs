@@ -1,20 +1,11 @@
-mod protocol;
-mod workspace_manager;
-mod server_handler;
-mod client_handler;
-
+use lsp_multiplexer::Muxer;
 use std::io::{BufReader, Write};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufStream};
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
+use tower_lsp::jsonrpc::{self, Message, NotificationBuilder, RequestBuilder, ResponseBuilder};
 use tower_lsp::lsp_types::*;
-use serde_json::json;
-
-use crate::workspace_manager::WorkspaceManager;
-use crate::protocol::JsonRpcMessage;
-use crate::server_handler::handle_server_messages;
-use crate::client_handler::handle_client_messages;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -27,7 +18,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("LSP multiplexer listening on {}", socket_path);
 
     // Create shared workspace manager
-    let workspace_manager = Arc::new(Mutex::new(WorkspaceManager::new()));
+    let workspace_manager = Arc::new(Mutex::new(Muxer::new()));
 
     // Accept connections
     loop {
@@ -46,128 +37,104 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Ok(n) = stream.read_line(&mut message_buf).await {
                 if n == 0 {
                     println!("Client disconnected before initialization");
-                    return;
+                    return Ok(());
                 }
 
                 // Parse the initialize request
-                if let Ok(msg) = serde_json::from_str::<JsonRpcMessage>(&message_buf) {
-                    match msg.content {
-                        protocol::JsonRpcContent::Request { id, method, params }
-                            if method == "initialize" =>
-                        {
-                            // Extract workspace root from initialize params
-                            if let Some(params) = params {
-                                if let Ok(init_params) =
-                                    serde_json::from_value::<InitializeParams>(params)
-                                {
-                                    let workspace_root = init_params
-                                        .root_uri
-                                        .map(|uri| uri.to_string())
-                                        .unwrap_or_else(|| "default_workspace".to_string());
+                if let Ok(message) = serde_json::from_str::<Message>(&message_buf) {
+                    // Check if it's a request with method "initialize"
+                    if message.method.as_deref() == Some("initialize") && message.id.is_some() {
+                        // Extract workspace root from initialize params
+                        if let Ok(init_params) = serde_json::from_value::<InitializeParams>(
+                            message.params.unwrap_or_default(),
+                        ) {
+                            let workspace_root = init_params
+                                .root_uri
+                                .map(|uri| uri.to_string())
+                                .unwrap_or_else(|| "default_workspace".to_string());
 
-                                    // Add client to workspace manager
-                                    let mut manager = workspace_manager.lock().await;
-                                    match manager.add_client(workspace_root.clone()) {
-                                        Ok((client_id, is_first_client)) => {
-                                            if is_first_client {
-                                                // Forward initialize to the new server
-                                                if let Some(server_process) =
-                                                    manager.get_server_process_mut()
-                                                {
-                                                    let server_stdin =
-                                                        server_process.stdin.as_mut().unwrap();
-                                                    let server_id =
-                                                        manager.get_next_server_request_id();
-                                                    let init_request = json!({
-                                                        "jsonrpc": "2.0",
-                                                        "id": server_id,
-                                                        "method": "initialize",
-                                                        "params": params
-                                                    });
+                            // Add client to workspace manager
+                            let mut manager = workspace_manager.lock().await;
+                            match manager.add_client(workspace_root.clone()) {
+                                Ok((client_id, is_first_client)) => {
+                                    if is_first_client {
+                                        // Forward initialize to the new server
+                                        let server_id = manager.get_next_server_request_id();
+                                        manager.send_request_to_server(
+                                            server_id,
+                                            client_id,
+                                            message.id.unwrap(),
+                                            "initialize".to_string(),
+                                            Some(serde_json::to_value(init_params).unwrap()),
+                                        )?;
 
-                                                    manager.map_request(
-                                                        server_id,
-                                                        client_id,
-                                                        serde_json::from_value(id).unwrap_or(0),
-                                                    );
+                                        // Spawn server message handling task
+                                        let server_stdout = BufReader::new(
+                                            manager
+                                                .get_server_process_mut()
+                                                .unwrap()
+                                                .stdout
+                                                .take()
+                                                .unwrap(),
+                                        );
+                                        let workspace_manager_clone =
+                                            Arc::clone(&workspace_manager);
+                                        tokio::spawn(async move {
+                                            workspace_manager_clone
+                                                .lock()
+                                                .await
+                                                .handle_server_messages(server_stdout)
+                                                .await;
+                                        });
+                                    } else {
+                                        // For subsequent clients, send workspace/didChangeWorkspaceFolders
+                                        let params = DidChangeWorkspaceFoldersParams {
+                                            event: WorkspaceFoldersChangeEvent {
+                                                added: vec![WorkspaceFolder {
+                                                    uri: Url::parse(&format!(
+                                                        "file://{}",
+                                                        workspace_root
+                                                    ))
+                                                    .unwrap(),
+                                                    name: workspace_root
+                                                        .split('/')
+                                                        .last()
+                                                        .unwrap_or("unknown")
+                                                        .to_string(),
+                                                }],
+                                                removed: vec![],
+                                            },
+                                        };
 
-                                                    writeln!(
-                                                        server_stdin,
-                                                        "{}",
-                                                        init_request.to_string()
-                                                    )?;
+                                        manager.send_notification_to_server(
+                                            "workspace/didChangeWorkspaceFolders".to_string(),
+                                            Some(serde_json::to_value(params).unwrap()),
+                                        )?;
 
-                                                    // Spawn server message handling task
-                                                    let server_stdout = BufReader::new(
-                                                        server_process.stdout.take().unwrap(),
-                                                    );
-                                                    let workspace_manager_clone =
-                                                        Arc::clone(&workspace_manager);
-                                                    tokio::spawn(async move {
-                                                        handle_server_messages(
-                                                            server_stdout,
-                                                            workspace_manager_clone,
-                                                        )
-                                                        .await;
-                                                    });
-                                                }
-                                            } else {
-                                                // For subsequent clients, send workspace/didChangeWorkspaceFolders
-                                                if let Some(server_process) =
-                                                    manager.get_server_process_mut()
-                                                {
-                                                    if let Some(stdin) =
-                                                        server_process.stdin.as_mut()
-                                                    {
-                                                        let notification = json!({
-                                                            "jsonrpc": "2.0",
-                                                            "method": "workspace/didChangeWorkspaceFolders",
-                                                            "params": {
-                                                                "event": {
-                                                                    "added": [{
-                                                                        "uri": format!("file://{}", workspace_root),
-                                                                        "name": workspace_root.split('/').last().unwrap_or("unknown")
-                                                                    }],
-                                                                    "removed": []
-                                                                }
-                                                            }
-                                                        });
-
-                                                        writeln!(
-                                                            stdin,
-                                                            "{}",
-                                                            notification.to_string()
-                                                        )?;
-                                                    }
-                                                }
-
-                                                // Return cached initialize response
-                                                // TODO: Implement caching of initialize response
-                                            }
-
-                                            // Start message forwarding loop
-                                            handle_client_messages(
-                                                client_id,
-                                                stream,
-                                                workspace_manager.clone(),
-                                            )
-                                            .await;
-                                        }
-                                        Err(e) => {
-                                            eprintln!("Failed to add client: {}", e);
-                                            return;
-                                        }
+                                        // Return cached initialize response
+                                        // TODO: Implement caching of initialize response
                                     }
+
+                                    // Start message forwarding loop
+                                    let workspace_manager_clone = Arc::clone(&workspace_manager);
+                                    tokio::spawn(async move {
+                                        workspace_manager_clone
+                                            .lock()
+                                            .await
+                                            .handle_client_messages(client_id, stream)
+                                            .await;
+                                    });
+                                }
+                                Err(e) => {
+                                    eprintln!("Failed to add client: {}", e);
+                                    return Ok(());
                                 }
                             }
-                        }
-                        _ => {
-                            eprintln!("Expected initialize request as first message");
-                            return;
                         }
                     }
                 }
             }
+            Ok(())
         });
     }
 }
