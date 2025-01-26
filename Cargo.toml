@@ -11,5 +11,7 @@ serde_json = "1"
 futures = "0.3"
 async-trait = "0.1"
 lsp-codec = "0.3.0"
-tokio-util = { version = "0.7.13", features = ["codec"] }
+tokio-util = { version = "0.6", features = ["codec"] }
 anyhow = "1"
+tracing = "0.1.41"
+tracing-subscriber = "0.3.19"
