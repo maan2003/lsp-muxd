@@ -39,7 +39,7 @@ use tokio::sync::mpsc;
 // Structure to track client-specific state
 #[derive(Clone)]
 pub struct Client {
-    workspace_root: Option<String>,
+    workspace_root: Option<Url>,
     client_response_tx: mpsc::Sender<Message>,
 }
 
@@ -49,7 +49,7 @@ pub struct WorkspaceManager {
     next_client_id: ClientId,
     clients: std::sync::Mutex<HashMap<ClientId, Client>>,
     request_map: Arc<RequestMap>,
-    workspace_roots: Vec<String>,
+    workspace_roots: Vec<Url>,
 }
 
 impl WorkspaceManager {
@@ -113,14 +113,13 @@ impl WorkspaceManager {
                 let _ = server.kill();
             }
         } else {
-            if let Some(ref root) = workspace_root {
+            if let Some(root) = workspace_root {
                 let params = DidChangeWorkspaceFoldersParams {
                     event: WorkspaceFoldersChangeEvent {
                         added: vec![],
                         removed: vec![WorkspaceFolder {
-                            uri: Url::parse(&format!("file://{}", root))
-                                .context("Failed to parse workspace root URL")?,
-                            name: root.split('/').last().unwrap_or("unknown").to_string(),
+                            uri: root,
+                            name: Default::default(),
                         }],
                     },
                 };
@@ -229,74 +228,65 @@ impl WorkspaceManager {
         if method == "initialize" {
             let mut client = self.get_client(client_id)?;
             // Parse initialize params
-            if let Ok(init_params) =
+            let init_params =
                 serde_json::from_value::<InitializeParams>(params.clone().unwrap_or(Value::Null))
-            {
-                // Extract workspace root
-                let workspace_root = init_params
-                    .root_uri
-                    .as_ref()
-                    .map(|uri| uri.path().to_string())
-                    .unwrap_or_else(|| "default_workspace".to_string());
+                    .context("invalid request")?;
+            // Extract workspace root
+            let workspace_root = init_params.root_uri.context("root uri not present")?;
 
-                client.workspace_root = Some(workspace_root.clone());
+            client.workspace_root = Some(workspace_root.clone());
 
-                // Add workspace root if not already present
-                if !self.workspace_roots.contains(&workspace_root) {
-                    self.workspace_roots.push(workspace_root.clone());
-                }
+            // Add workspace root if not already present
+            if !self.workspace_roots.contains(&workspace_root) {
+                self.workspace_roots.push(workspace_root.clone());
+            }
 
-                let mut server_process = self.server_process.lock().await;
-                if server_process.is_none() {
-                    // Launch the global LSP server process
-                    let new_server_process = Command::new("rust-analyzer")
-                        .stdin(Stdio::piped())
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped())
-                        .spawn()
-                        .context("Failed to spawn rust-analyzer process")?;
+            let mut server_process = self.server_process.lock().await;
+            if server_process.is_none() {
+                // Launch the global LSP server process
+                let new_server_process = Command::new("rust-analyzer")
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .context("Failed to spawn rust-analyzer process")?;
 
-                    *server_process = Some(new_server_process);
+                *server_process = Some(new_server_process);
 
-                    // Take server stdout for handling messages
-                    if let Some(server) = server_process.as_mut() {
-                        if let Some(stdout) = server.stdout.take() {
-                            let server_stdout = BufReader::new(stdout);
-                            // FIXME:
-                            // let this = Arc::new(Mutex::new(self.clone()));
-                            // tokio::spawn(async move {
-                            //     let mut manager = this.lock().await;
-                            //     manager.handle_server_messages(server_stdout).await;
-                            // });
-                        }
+                // Take server stdout for handling messages
+                if let Some(server) = server_process.as_mut() {
+                    if let Some(stdout) = server.stdout.take() {
+                        let _server_stdout = BufReader::new(stdout);
+                        // FIXME:
+                        // let this = Arc::new(Mutex::new(self.clone()));
+                        // tokio::spawn(async move {
+                        //     let mut manager = this.lock().await;
+                        //     manager.handle_server_messages(server_stdout).await;
+                        // });
                     }
-                } else {
-                    drop(server_process);
-                    // Send workspace/didChangeWorkspaceFolders for additional clients
-                    let params = DidChangeWorkspaceFoldersParams {
-                        event: WorkspaceFoldersChangeEvent {
-                            added: vec![WorkspaceFolder {
-                                uri: Url::parse(&format!("file://{}", workspace_root))
-                                    .context("Failed to parse workspace root URL")?,
-                                name: workspace_root
-                                    .split('/')
-                                    .last()
-                                    .unwrap_or("unknown")
-                                    .to_string(),
-                            }],
-                            removed: vec![],
-                        },
-                    };
+                }
+            } else {
+                drop(server_process);
+                // Send workspace/didChangeWorkspaceFolders for additional clients
+                let params = DidChangeWorkspaceFoldersParams {
+                    event: WorkspaceFoldersChangeEvent {
+                        added: vec![WorkspaceFolder {
+                            uri: workspace_root,
+                            name: Default::default(),
+                        }],
+                        removed: vec![],
+                    },
+                };
 
-                    self.handle_client_notification(
-                        "workspace/didChangeWorkspaceFolders".into(),
-                        Some(
+                self.send_server_message(
+                    Request::build("workspace/didChangeWorkspaceFolders")
+                        .params(
                             serde_json::to_value(params)
                                 .context("Failed to serialize workspace change params")?,
-                        ),
-                    )
-                    .await?;
-                }
+                        )
+                        .finish(),
+                )
+                .await?;
             }
         }
 
