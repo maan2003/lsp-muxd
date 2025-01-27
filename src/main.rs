@@ -1,3 +1,4 @@
+use anyhow::Context;
 use fork::{fork, Fork};
 use lsp_muxd::WorkspaceManager;
 use std::{
@@ -43,12 +44,25 @@ fn main() -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn run_background(listener: UnixListener) -> anyhow::Result<()> {
-    tracing_subscriber::fmt().init();
+    // tracing_subscriber::fmt().init();
     listener.set_nonblocking(true)?;
     let listener = tokio::net::UnixListener::from_std(listener)?;
     info!("running server");
     let workspace_manager = Arc::new(Mutex::new(WorkspaceManager::new()));
-    return lsp_muxd::run_multiplexer(workspace_manager, listener).await;
+
+    loop {
+        let (stream, _) = listener
+            .accept()
+            .await
+            .context("Failed to accept connection")?;
+        let workspace_manager = Arc::clone(&workspace_manager);
+
+        tokio::spawn(async move {
+            if let Err(e) = lsp_muxd::handle_connection(stream, workspace_manager).await {
+                error!("Failed to handle connection: {}", e);
+            }
+        });
+    }
 }
 
 #[tokio::main]

@@ -3,11 +3,9 @@ use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
-use tokio::io::{AsyncRead, BufReader};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::io::{AsyncRead, AsyncWrite, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{watch, Mutex};
 use tokio_util::codec::{FramedRead, FramedWrite};
@@ -182,7 +180,6 @@ impl WorkspaceManager {
                 }
                 Err(e) => {
                     error!("Error reading from server: {:?}", e);
-                    break;
                 }
             }
         }
@@ -293,27 +290,8 @@ impl WorkspaceManager {
     }
 }
 
-pub async fn run_multiplexer(
-    workspace_manager: Arc<Mutex<WorkspaceManager>>,
-    listener: UnixListener,
-) -> Result<()> {
-    loop {
-        let (stream, _) = listener
-            .accept()
-            .await
-            .context("Failed to accept connection")?;
-        let workspace_manager = Arc::clone(&workspace_manager);
-
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, workspace_manager).await {
-                error!("Failed to handle connection: {}", e);
-            }
-        });
-    }
-}
-
 pub async fn handle_connection(
-    stream: UnixStream,
+    stream: impl AsyncRead + AsyncWrite + Unpin,
     workspace_manager: Arc<Mutex<WorkspaceManager>>,
 ) -> Result<()> {
     info!("New client connected");
@@ -325,7 +303,7 @@ pub async fn handle_connection(
         .await
         .register_client(client_response_tx);
 
-    let (read_half, write_half) = stream.into_split();
+    let (read_half, write_half) = tokio::io::split(stream);
 
     let mut reader = FramedRead::new(read_half, LspCodec::default());
     let writer = FramedWrite::new(write_half, LspCodec::default());
