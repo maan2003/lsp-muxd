@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::{Child, Command};
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tower_lsp::jsonrpc::{self, Request, Response};
 use tower_lsp::lsp_types::*;
@@ -23,9 +23,10 @@ use request_map::RequestMap;
 pub type ClientId = u64;
 pub type RequestId = jsonrpc::Id;
 pub type ServerRequestId = i64;
+const INIT_ID: jsonrpc::Id = RequestId::Number(0);
 
 /// An incoming or outgoing JSON-RPC message.
-#[derive(Deserialize, Clone, Serialize)]
+#[derive(Deserialize, Clone, Serialize, Debug)]
 #[serde(untagged)]
 pub enum Message {
     /// A response message.
@@ -49,6 +50,7 @@ pub struct WorkspaceManager {
     next_client_id: ClientId,
     clients: HashMap<ClientId, Client>,
     request_map: Arc<RequestMap>,
+    initialize_response: watch::Sender<Option<Result<serde_json::Value, jsonrpc::Error>>>,
 }
 
 impl WorkspaceManager {
@@ -58,6 +60,7 @@ impl WorkspaceManager {
             next_client_id: 1,
             clients: HashMap::new(),
             request_map: Arc::new(RequestMap::new()),
+            initialize_response: Default::default(),
         }
     }
 
@@ -130,21 +133,19 @@ impl WorkspaceManager {
             // If it's a Response, figure out which client it belongs to using request_map.
             Message::Response(resp) => {
                 let (id, resp) = resp.into_parts();
+                // resp
+                if id == INIT_ID {
+                    self.initialize_response.send(Some(resp)).ok();
+                    return Ok(());
+                }
                 // Attempt to parse the response ID as server_request_id (u64).
                 let (mapped_client_id, original_req_id) =
                     self.request_map.remove(&id).context("unknown response")?;
-                let Some(client) = self.clients.get(&mapped_client_id) else {
-                    warn!("server response after client gone");
-                    return Ok(());
-                };
-                client
-                    .client_response_tx
-                    .send(Message::Response(Response::from_parts(
-                        original_req_id,
-                        resp,
-                    )))
-                    .await
-                    .ok();
+                self.send_client_message(
+                    mapped_client_id,
+                    Message::Response(Response::from_parts(original_req_id, resp)),
+                )
+                .await;
             }
 
             Message::Request(_) => {
@@ -155,6 +156,15 @@ impl WorkspaceManager {
         }
         Ok(())
     }
+
+    pub async fn send_client_message(&mut self, client: ClientId, message: Message) {
+        let Some(client) = self.clients.get(&client) else {
+            warn!("client gone");
+            return;
+        };
+        client.client_response_tx.send(message).await.ok();
+    }
+
     pub async fn handle_server_messages(this: &Mutex<Self>, server_stdout: impl AsyncRead + Unpin) {
         let mut reader = FramedRead::new(server_stdout, LspCodec::default());
 
@@ -186,9 +196,12 @@ impl WorkspaceManager {
     ) -> Result<()> {
         let (method, id, params) = request.into_parts();
 
+        info!("method: {method}");
         // Special handling for initialize request
         if method == "initialize" {
-            Self::handle_client_initialize(this, client_id, &params).await?;
+            Self::handle_client_initialize(this, client_id, id.as_ref().unwrap(), &params).await?;
+        } else if method == "exit" || method == "shutdown" {
+            // ignore
         } else {
             let mut this = this.lock().await;
             let request = Request::build(method).params(params.unwrap_or(Value::Null));
@@ -206,6 +219,7 @@ impl WorkspaceManager {
     async fn handle_client_initialize(
         this: &Arc<Mutex<Self>>,
         client_id: ClientId,
+        id: &RequestId,
         params: &Option<Value>,
     ) -> Result<(), anyhow::Error> {
         let mut thil = this.lock().await;
@@ -218,11 +232,12 @@ impl WorkspaceManager {
             .context("client gone")?
             .workspace_root = Some(workspace_root.clone());
         if thil.server_process.is_none() {
+            info!("spawning server");
             // Launch the global LSP server process
             let mut new_server_process = Command::new("rust-analyzer")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
+                .stderr(Stdio::inherit())
                 .spawn()
                 .context("Failed to spawn rust-analyzer process")?;
 
@@ -230,6 +245,16 @@ impl WorkspaceManager {
             let server_stdout = BufReader::new(stdout);
             thil.server_process = Some(new_server_process);
 
+            thil.send_server_message(
+                Request::build("initialize")
+                    .params(
+                        serde_json::to_value(params)
+                            .context("Failed to serialize workspace change params")?,
+                    )
+                    .id(INIT_ID)
+                    .finish(),
+            )
+            .await?;
             // Take server stdout for handling messages
             let this = this.clone();
             tokio::spawn(async move { Self::handle_server_messages(&this, server_stdout).await });
@@ -254,6 +279,16 @@ impl WorkspaceManager {
             )
             .await?;
         }
+        let mut sub = thil.initialize_response.subscribe();
+        drop(thil);
+        let value = sub.wait_for(|x| x.is_some()).await?.clone().unwrap();
+        this.lock()
+            .await
+            .send_client_message(
+                client_id,
+                Message::Response(Response::from_parts(id.clone(), value)),
+            )
+            .await;
         Ok(())
     }
 }

@@ -463,7 +463,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "lsp-multiplexer"
+name = "lsp-muxd"
 version = "0.1.0"
 dependencies = [
  "anyhow",

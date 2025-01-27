@@ -15,7 +15,7 @@ impl RequestMap {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
-            next_server_request_id: AtomicI64::new(0),
+            next_server_request_id: AtomicI64::new(1),
         }
     }
 
