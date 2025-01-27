@@ -294,20 +294,9 @@ impl WorkspaceManager {
 }
 
 pub async fn run_multiplexer(
-    socket_path: &Path,
     workspace_manager: Arc<Mutex<WorkspaceManager>>,
+    listener: UnixListener,
 ) -> Result<()> {
-    // Remove existing socket file if it exists
-    let _ = std::fs::remove_file(socket_path);
-
-    // Bind UnixListener
-    let listener =
-        UnixListener::bind(socket_path).context("Failed to bind to Unix domain socket")?;
-    info!(
-        "LSP multiplexer listening on {}",
-        socket_path.to_string_lossy()
-    );
-
     loop {
         let (stream, _) = listener
             .accept()

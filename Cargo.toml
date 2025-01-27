@@ -12,7 +12,9 @@ futures = "0.3"
 async-trait = "0.1"
 lsp-codec = "0.3.0"
 tokio-util = { version = "0.6", features = ["codec"] }
-anyhow = "1"
+anyhow = { version = "1", features = ["backtrace"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["fmt"] }
 dirs = "6.0.0"
+fork = "0.2.0"
+fd-lock = "4.0.2"
