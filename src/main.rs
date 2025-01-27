@@ -30,7 +30,9 @@ enum ProcessKind {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let runtime_dir = dirs::runtime_dir().expect("RUNTIME dir must be set");
+    let runtime_dir = dirs::runtime_dir()
+        .unwrap_or_else(dirs::data_local_dir)
+        .expect("RUNTIME dir must be set");
     let socket_path = runtime_dir.join(format!(
         "lsp-muxd-{instance_id}.sock",
         instance_id = cli.instance_id
