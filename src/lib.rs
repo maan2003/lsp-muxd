@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use codec::LanguageServerCodec;
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -13,14 +14,16 @@ use tower_lsp::jsonrpc::{self, Request, Response};
 use tower_lsp::lsp_types::*;
 use tracing::{error, info, warn};
 
+mod codec;
 mod request_map;
 
-use lsp_codec::LspCodec;
 use request_map::RequestMap;
 
 pub type ClientId = u64;
 pub type RequestId = jsonrpc::Id;
 pub type ServerRequestId = i64;
+pub type LspCodec = LanguageServerCodec<Message>;
+
 const INIT_ID: jsonrpc::Id = RequestId::Number(0);
 
 /// An incoming or outgoing JSON-RPC message.
@@ -120,7 +123,7 @@ impl WorkspaceManager {
             .context("server is down")?;
         let mut writer = FramedWrite::new(stdin, LspCodec::default());
         writer
-            .send(serde_json::to_value(request)?)
+            .send(Message::Request(request))
             .await
             .map_err(|_| anyhow::format_err!("failed to send request"))?;
         Ok(())
@@ -168,14 +171,10 @@ impl WorkspaceManager {
 
         while let Some(message_result) = reader.next().await {
             match message_result {
-                Ok(json_val) => {
+                Ok(message) => {
                     // Attempt to parse into Message.
-                    if let Ok(message) = serde_json::from_value::<Message>(json_val.clone()) {
-                        if let Err(e) = this.lock().await.handle_server_message(message).await {
-                            error!("Failed to handle server message: {e:?}");
-                        }
-                    } else {
-                        error!("Server sent unrecognized JSON: {:?}", json_val);
+                    if let Err(e) = this.lock().await.handle_server_message(message).await {
+                        error!("Failed to handle server message: {e:?}");
                     }
                 }
                 Err(e) => {
@@ -291,7 +290,7 @@ impl WorkspaceManager {
 }
 
 pub async fn handle_connection(
-    stream: impl AsyncRead + AsyncWrite + Unpin,
+    stream: impl AsyncRead + AsyncWrite + Unpin + Sync + Send + 'static,
     workspace_manager: Arc<Mutex<WorkspaceManager>>,
 ) -> Result<()> {
     info!("New client connected");
@@ -311,10 +310,7 @@ pub async fn handle_connection(
     tokio::spawn(async move {
         let mut writer = writer;
         while let Some(msg) = client_response_rx.recv().await {
-            if let Err(e) = writer
-                .send(serde_json::to_value(msg).expect("serialize always works"))
-                .await
-            {
+            if let Err(e) = writer.send(msg).await {
                 error!("Error sending response to client: {:?}", e);
                 break;
             }
@@ -327,7 +323,6 @@ pub async fn handle_connection(
         .transpose()
         .map_err(|e| anyhow::format_err!("invalid input: {e:?}"))?
     {
-        let message = serde_json::from_value::<Message>(message).context("invalid request")?;
         match message {
             Message::Response(_) => warn!("ignore client response"),
             Message::Request(request) => {

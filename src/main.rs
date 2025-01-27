@@ -10,7 +10,7 @@ use tokio::{
     io::{self, stdin, stdout},
     sync::Mutex,
 };
-use tracing::info;
+use tracing::{error, info};
 
 enum ProcessKind {
     Server(UnixListener),

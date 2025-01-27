@@ -491,27 +491,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04cbf5b083de1c7e0222a7a51dbfdba1cbe1c6ab0b15e29fff3f6c077fd9cd9f"
 
 [[package]]
-name = "lsp-codec"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aa939d0b62476a5a19fb7fcb423a5c6ce8c7e09b851d37531e2fe3e0e6d9d257"
-dependencies = [
- "bytes",
- "serde_json",
- "tokio-util 0.6.10",
-]
-
-[[package]]
 name = "lsp-muxd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bytes",
  "dirs",
  "fd-lock",
  "fork",
  "futures",
- "lsp-codec",
+ "httparse",
+ "memchr",
  "serde",
  "serde_json",
  "tokio",
