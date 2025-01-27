@@ -1,4 +1,5 @@
 use anyhow::Context;
+use clap::Parser;
 use fork::{fork, Fork};
 use lsp_muxd::WorkspaceManager;
 use std::{
@@ -12,14 +13,28 @@ use tokio::{
 };
 use tracing::{error, info};
 
+#[derive(Parser, Debug)]
+#[command(author, version, about)]
+struct Cli {
+    #[arg(long, default_value = "default")]
+    instance_id: String,
+    server_cmd: String,
+    #[arg(num_args = 0.., trailing_var_arg = true)]
+    server_args: Vec<String>,
+}
+
 enum ProcessKind {
     Server(UnixListener),
     Client(UnixStream),
 }
 
 fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
     let runtime_dir = dirs::runtime_dir().expect("RUNTIME dir must be set");
-    let socket_path = runtime_dir.join("lsp-muxd.sock");
+    let socket_path = runtime_dir.join(format!(
+        "lsp-muxd-{instance_id}.sock",
+        instance_id = cli.instance_id
+    ));
     let lock_file = runtime_dir.join("lsp-muxd.lock");
     let mut lock_file = fd_lock::RwLock::new(std::fs::File::create(lock_file)?);
     let lock_file = lock_file.write()?;
@@ -37,18 +52,22 @@ fn main() -> anyhow::Result<()> {
     };
     drop(lock_file);
     match proc {
-        ProcessKind::Server(listener) => run_background(listener),
+        ProcessKind::Server(listener) => run_background(listener, cli.server_cmd, cli.server_args),
         ProcessKind::Client(stream) => run_client(stream),
     }
 }
 
 #[tokio::main]
-async fn run_background(listener: UnixListener) -> anyhow::Result<()> {
+async fn run_background(
+    listener: UnixListener,
+    server_cmd: String,
+    server_args: Vec<String>,
+) -> anyhow::Result<()> {
     // tracing_subscriber::fmt().init();
     listener.set_nonblocking(true)?;
     let listener = tokio::net::UnixListener::from_std(listener)?;
     info!("running server");
-    let workspace_manager = Arc::new(Mutex::new(WorkspaceManager::new()));
+    let workspace_manager = Arc::new(Mutex::new(WorkspaceManager::new(server_cmd, server_args)));
 
     loop {
         let (stream, _) = listener

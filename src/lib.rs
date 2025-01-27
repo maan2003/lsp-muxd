@@ -52,16 +52,20 @@ pub struct WorkspaceManager {
     clients: HashMap<ClientId, Client>,
     request_map: Arc<RequestMap>,
     initialize_response: watch::Sender<Option<Result<serde_json::Value, jsonrpc::Error>>>,
+    server_cmd: String,
+    server_args: Vec<String>,
 }
 
 impl WorkspaceManager {
-    pub fn new() -> Self {
+    pub fn new(server_cmd: String, server_args: Vec<String>) -> Self {
         WorkspaceManager {
             server_process: None,
             next_client_id: 1,
             clients: HashMap::new(),
             request_map: Arc::new(RequestMap::new()),
             initialize_response: Default::default(),
+            server_cmd,
+            server_args,
         }
     }
 
@@ -230,12 +234,14 @@ impl WorkspaceManager {
         if thil.server_process.is_none() {
             info!("spawning server");
             // Launch the global LSP server process
-            let mut new_server_process = Command::new("rust-analyzer")
+            let mut cmd = Command::new(&thil.server_cmd);
+            cmd.args(&thil.server_args);
+            let mut new_server_process = cmd
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::inherit())
                 .spawn()
-                .context("Failed to spawn rust-analyzer process")?;
+                .context("Failed to spawn LSP server process")?;
 
             let stdout = BufReader::new(new_server_process.stdout.take().unwrap());
             let server_stdout = BufReader::new(stdout);
